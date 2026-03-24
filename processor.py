@@ -2,6 +2,7 @@ import os
 import time
 import pandas as pd
 import re
+import glob
 import streamlit as st
 
 try:
@@ -31,9 +32,9 @@ def get_api_key():
     # 若無，則嘗試從環境變數取得 (包括 .env)
     return os.getenv("GEMINI_API_KEY")
 
-def process_labor_pay_pdf(input_pdf_path: str, output_excel_path: str) -> tuple[bool, str]:
+def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[bool, str]:
     """
-    整合原始 OCR 檢核邏輯的處理模組。
+    處理單一 PDF 或整個資料夾的 PDF，並輸出為多個分頁的 Excel。
     """
     load_env_file() # 自動載入本地 API KEY
     
@@ -72,96 +73,123 @@ def process_labor_pay_pdf(input_pdf_path: str, output_excel_path: str) -> tuple[
     4. 在 CSV 區塊之後，請務必加上一行標註：`TOTAL_ROWS: [數字]`，代表你辨識到的資料總數(不含標題)。
     """
 
-    uploaded_file = None
-    audit_msg = ""
-    try:
-        uploaded_file = genai.upload_file(input_pdf_path)
-        time.sleep(5)  # 等待文檔處理
+    # 判斷 target_path 是檔案還是目錄，準備要處理的檔案清單
+    pdf_files = []
+    if os.path.isdir(target_path):
+        pdf_files = glob.glob(os.path.join(target_path, "**/*.pdf"), recursive=True)
+    elif os.path.isfile(target_path) and target_path.lower().endswith(".pdf"):
+        pdf_files = [target_path]
         
-        response = model.generate_content([uploaded_file, prompt])
-        full_text = response.text.strip()
-        
-        # 分離 CSV 與 對帳統計
-        csv_part = full_text
-        expected_count = 0
-        
-        # Regex 抓取 TOTAL_ROWS: [數字]
-        match = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
-        if match:
-            expected_count = int(match.group(1))
-        
-        if "```" in full_text:
-            csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
-            if csv_blocks: csv_part = csv_blocks[0].strip()
+    if not pdf_files:
+        return False, "在下載的內容中找不到任何 PDF 檔案可以處理。"
 
-        # 解析 CSV (手動逐行解析確保防呆)
-        parsed_rows = []
-        raw_lines = csv_part.strip().split("\n")
-        header = None
-        for line in raw_lines:
-            fields = [f.strip() for f in line.split(",")]
-            if header is None:
-                header = fields[:3]
-                continue
-            padded = (fields[:3] + ['', '', ''])[:3]
-            parsed_rows.append(padded)
-            
-        df = pd.DataFrame(parsed_rows, columns=header if header else ['編號', '姓名', 'AI_辨識疑慮'])
-        actual_count = len(df)
-        
-        # 對帳監控
-        if expected_count > 0:
-            is_match = (actual_count == expected_count)
-            log_icon = "✅" if is_match else "⚠️"
-            diff_count = abs(expected_count - actual_count)
-            log_detail = f"100% 吻合" if is_match else f"筆數不符，差 {diff_count} 筆"
-            audit_msg = f"對帳監控：預期 {expected_count} 筆 / 實得 {actual_count} 筆 ({log_icon} {log_detail})"
-        else:
-            audit_msg = f"解析筆數：{actual_count} 筆 (未取得 AI 預期統計)"
+    all_dfs = {}
+    audit_logs = []
 
-        # 檢核邏輯
-        def check_reliability(row):
-            warnings = []
-            target_cols = [c for c in df.columns if c != 'AI_辨識疑慮']
-            id_col = next((c for c in target_cols if '編號' in str(c) or '號' in str(c)), None)
-            name_col = next((c for c in target_cols if '姓名' in str(c) or '名' in str(c)), None)
-            
-            if not id_col or pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ['?', 'nan', '']:
-                warnings.append("🚨嚴重:編號遺失")
-            elif not str(row[id_col]).strip().isdigit():
-                warnings.append("⚠️異狀:編號非數字")
-                    
-            if not name_col or pd.isna(row.get(name_col)) or str(row.get(name_col)).strip() in ['?', 'nan', '']:
-                warnings.append("🚨嚴重:姓名遺失")
-            
-            ai_note = str(row.get('AI_辨識疑慮', '')).strip()
-            if ai_note and ai_note not in ['nan', '否', '正常', '?', 'None', 'False', 'True', '0', '1']:
-                warnings.append(f"🤖AI註記:{ai_note}")
-            
-            return " | ".join(warnings) if warnings else "正常"
-            
-        df['AI_辨識疑慮'] = df.apply(check_reliability, axis=1)
+    for pdf_file in pdf_files:
+        # sheet_name 最長31字元，且不能包含特殊字元
+        base_name = os.path.basename(pdf_file).replace('.pdf', '')
+        sheet_name = re.sub(r'[\\/\*\?\[\]:]', '', base_name)[:31]
         
-        # 重複檢測
-        id_col = next((c for c in df.columns if '編號' in str(c) or '號' in str(c)), None)
-        if id_col:
-            valid_mask = df[id_col].notna() & (~df[id_col].astype(str).str.strip().isin(['?', '??', 'nan', '']))
-            dup_mask = pd.Series(False, index=df.index)
-            dup_mask[valid_mask] = df.loc[valid_mask, id_col].duplicated(keep=False)
-            if dup_mask.any():
-                df.loc[dup_mask, 'AI_辨識疑慮'] = df.loc[dup_mask, 'AI_辨識疑慮'].astype(str) + " | ⚠️重複編號"
+        uploaded_file = None
+        try:
+            uploaded_file = genai.upload_file(pdf_file)
+            time.sleep(5)  # 等待文檔處理完畢
+            
+            response = model.generate_content([uploaded_file, prompt])
+            full_text = response.text.strip()
+            
+            # 分離 CSV 與 對帳統計
+            csv_part = full_text
+            expected_count = 0
+            
+            # Regex 抓取 TOTAL_ROWS: [數字]
+            match = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
+            if match:
+                expected_count = int(match.group(1))
+            
+            if "```" in full_text:
+                csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
+                if csv_blocks: csv_part = csv_blocks[0].strip()
+
+            # 解析 CSV (手動逐行解析確保防呆)
+            parsed_rows = []
+            raw_lines = csv_part.strip().split("\n")
+            header = None
+            for line in raw_lines:
+                fields = [f.strip() for f in line.split(",")]
+                if header is None:
+                    header = fields[:3]
+                    continue
+                padded = (fields[:3] + ['', '', ''])[:3]
+                parsed_rows.append(padded)
                 
-        # 存檔
-        with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False)
+            df = pd.DataFrame(parsed_rows, columns=header if header else ['編號', '姓名', 'AI_辨識疑慮'])
+            actual_count = len(df)
             
-        return True, audit_msg
+            # 對帳監控
+            if expected_count > 0:
+                is_match = (actual_count == expected_count)
+                log_icon = "✅" if is_match else "⚠️"
+                diff_count = abs(expected_count - actual_count)
+                log_detail = "100%吻合" if is_match else f"筆數不符，差 {diff_count} 筆"
+                audit_logs.append(f"【{sheet_name}】: 預期 {expected_count} / 實得 {actual_count} ({log_icon} {log_detail})")
+            else:
+                audit_logs.append(f"【{sheet_name}】: 解析筆數 {actual_count} 筆 (未取得 AI 預期統計)")
 
-    except Exception as e:
-        return False, f"OCR 處理失敗: {e}"
-    finally:
-        if uploaded_file: 
-            try:
-                genai.delete_file(uploaded_file.name)
-            except Exception:
-                pass
+            # 檢核邏輯
+            def check_reliability(row):
+                warnings = []
+                target_cols = [c for c in df.columns if c != 'AI_辨識疑慮']
+                id_col = next((c for c in target_cols if '編號' in str(c) or '號' in str(c)), None)
+                name_col = next((c for c in target_cols if '姓名' in str(c) or '名' in str(c)), None)
+                
+                if not id_col or pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ['?', 'nan', '']:
+                    warnings.append("🚨嚴重:編號遺失")
+                elif not str(row[id_col]).strip().isdigit():
+                    warnings.append("⚠️異狀:編號非數字")
+                        
+                if not name_col or pd.isna(row.get(name_col)) or str(row.get(name_col)).strip() in ['?', 'nan', '']:
+                    warnings.append("🚨嚴重:姓名遺失")
+                
+                ai_note = str(row.get('AI_辨識疑慮', '')).strip()
+                if ai_note and ai_note not in ['nan', '否', '正常', '?', 'None', 'False', 'True', '0', '1']:
+                    warnings.append(f"🤖AI註記:{ai_note}")
+                
+                return " | ".join(warnings) if warnings else "正常"
+                
+            df['AI_辨識疑慮'] = df.apply(check_reliability, axis=1)
+            
+            # 重複檢測
+            id_col = next((c for c in df.columns if '編號' in str(c) or '號' in str(c)), None)
+            if id_col:
+                valid_mask = df[id_col].notna() & (~df[id_col].astype(str).str.strip().isin(['?', '??', 'nan', '']))
+                dup_mask = pd.Series(False, index=df.index)
+                dup_mask[valid_mask] = df.loc[valid_mask, id_col].duplicated(keep=False)
+                if dup_mask.any():
+                    df.loc[dup_mask, 'AI_辨識疑慮'] = df.loc[dup_mask, 'AI_辨識疑慮'].astype(str) + " | ⚠️重複編號"
+                    
+            all_dfs[sheet_name] = df
+
+        except Exception as e:
+            audit_logs.append(f"【{sheet_name}】: ❌ 處理發生錯誤 - {e}")
+        finally:
+            if uploaded_file: 
+                try:
+                    genai.delete_file(uploaded_file.name)
+                except Exception:
+                    pass
+                    
+    # 所有檔案處理完畢，合併打包成單一 Excel (多個 Sheet 分頁)
+    if all_dfs:
+        try:
+            with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
+                for sn, d in all_dfs.items():
+                    d.to_excel(writer, sheet_name=sn, index=False)
+                    
+            global_audit_msg = "\n".join(audit_logs)
+            return True, global_audit_msg
+        except Exception as e:
+            return False, f"Excel 打包失敗: {e}"
+    else:
+        return False, "所有 PDF 皆處理失敗，未生成 Excel。"
