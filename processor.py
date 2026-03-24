@@ -32,7 +32,7 @@ def get_api_key():
     # 若無，則嘗試從環境變數取得 (包括 .env)
     return os.getenv("GEMINI_API_KEY")
 
-def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[bool, str]:
+def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_container=None) -> tuple[bool, str]:
     """
     處理單一 PDF 或整個資料夾的 PDF，並輸出為多個分頁的 Excel。
     """
@@ -68,13 +68,18 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
     prompt = """
     這是一份「勞作金名冊」手寫掃描件。請執行以下任務：
     1. 【🧐 嚴謹思維鏈分析】在輸出資料前，請仔細觀察圖片中表格的每一列。特別注意：
-       - 編號多為數字，手寫連筆容易誤判（例如：數字 8 容易寫得像 5 或 0；數字 5 容易寫得像 1 ；編號最後一碼經常帶有勾筆或變形）。
+       - 編號多為數字，這是系統的唯一識別碼，**極度重要，辨識錯誤是非常嚴重的問題**！手寫連筆極易誤判（例如：數字 8 常常被寫得像 1 加上一個圈，或者像 5、0；數字 5 容易寫得像 1 ；編號最後一碼經常帶有勾筆或變形）。
+       - 當你看到一根豎線旁邊帶有封閉或半封閉的圈套，請高度懷疑它是 `8` 而不是 `1` 或 `5`。
        - 姓名為中文，請根據筆畫結構、前後文與常見百家姓推敲草寫字。
-       - 請先在 `<thinking>` 標籤內，簡短記錄你對每一列模糊字跡（尤其是編號）的推論過程。
+       - 請先在 `<thinking>` 標籤內，針對「編號」進行特別的交叉比對與推論，若有任何一絲疑慮，必須記錄下來。
     2. 【📋 輸出 CSV 資料】標題行必須為：「編號,姓名,AI_辨識疑慮」。
        - 請務必將 CSV 資料段落獨立包裝在 ```csv 與 ``` 區塊內。
     3. 【🚨 嚴格命令：禁止漏行】即便字跡模糊也必須輸出一行，完全看不懂的字元請填 `?`，切勿整行跳過。
-    4. 【⚠️ AI_辨識疑慮填寫規則】字跡清楚填「否」；字跡模糊、連筆難辨（特別是數字末碼或姓名）請填「是(說明原因，例如：編號末字筆畫像8也像5)」；完全解譯失敗填「?」。
+    4. 【⚠️ AI_辨識疑慮填寫規則】
+       - **最高警報：只要「編號」的任何一個數字不是 100% 清晰，有連筆、塗改或是長得像 A 也像 B 的情況，必須強制在該欄位填寫「是(數字疑慮：可能為 X 或 Y)」。**
+       - 姓名若有連筆難辨，請填寫「是(姓名連筆：說明原因)」。
+       - 只有當字跡完全清晰確切，且 100% 肯定沒有連筆混淆可能時，才可填寫「否」。
+       - 完全解譯失敗填「?」。
     5. 【📊 總計標註】在 CSV 區塊之後，請務必加上獨立一行標註：`TOTAL_ROWS: [數字]`，代表你辨識到的資料總筆數(不含標題)。
     """
 
@@ -92,26 +97,36 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
     audit_logs = []
     
     total_files = len(pdf_files)
-    progress_text = st.empty()
-    progress_bar = st.empty()
+
+    if status_container:
+        progress_bar = status_container.progress(0)
+    else:
+        progress_text = st.empty()
+        progress_bar = st.empty()
+
+    def log_status(msg):
+        if status_container:
+            status_container.write(msg)
+        else:
+            progress_text.info(msg)
 
     for idx, pdf_file in enumerate(pdf_files):
         # sheet_name 最長31字元，且不能包含特殊字元
         base_name = os.path.basename(pdf_file).replace('.pdf', '')
         sheet_name = re.sub(r'[\\/\*\?\[\]:]', '', base_name)[:31]
         
-        progress_text.info(f"⏳ 正在處理第 {idx + 1}/{total_files} 個檔案：`{base_name}` ...")
+        log_status(f"⏳ 正在處理第 {idx + 1}/{total_files} 個檔案：`{base_name}` ...")
         if total_files > 0:
             progress_bar.progress(idx / total_files)
             
         uploaded_file = None
         try:
             uploaded_file = genai.upload_file(pdf_file)
-            progress_text.info(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識，此步驟需要較長時間...")
+            log_status(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識，此步驟需要較長時間...")
             time.sleep(5)  # 等待文檔處理完畢
             
             response = model.generate_content([uploaded_file, prompt])
-            progress_text.info(f"🧠 `{base_name}` AI 辨識完成，正在解析並轉換資料結構...")
+            log_status(f"🧠 `{base_name}` AI 辨識完成，正在解析並轉換資料結構...")
             full_text = response.text.strip()
             
             # 分離 CSV 與 對帳統計
@@ -197,10 +212,13 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
                     
     if total_files > 0:
         progress_bar.progress(1.0)
-    progress_text.success("✅ 所有檔案皆已通過 AI 辨識與資料解析！準備產出報表...")
+        
+    log_status("✅ 所有檔案皆已通過 AI 辨識與資料解析！準備產出報表...")
     time.sleep(1)
-    progress_text.empty()
-    progress_bar.empty()
+    
+    if not status_container:
+        progress_text.empty()
+        progress_bar.empty()
 
     # 所有檔案處理完畢，合併打包成單一 Excel (多個 Sheet 分頁)
     if all_dfs:

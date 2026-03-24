@@ -70,12 +70,13 @@ def main():
 
             st.success(f"✅ 成功下載 {'整個目錄的 PDF 檔案' if link_type == 'folder' else '單一 PDF 檔案'}。")
 
-            with st.spinner("🧠 正在透過 AI 執行高精準度批量 OCR 轉換，請稍候（可能需要數分鐘）..."):
+            with st.status("🧠 正在透過 AI 執行高精準度批量 OCR 轉換，請稍候（可能需要數分鐘）...", expanded=True) as status:
                 try:
                     # 呼叫已經封裝好的轉換邏輯，現在 target_path 可能是目錄或檔案
-                    success, audit_msg = process_labor_pay_pdf(target_path, excel_path)
+                    success, audit_msg = process_labor_pay_pdf(target_path, excel_path, status)
                     
                     if success and os.path.exists(excel_path):
+                        status.update(label="✅ 所有檔案辨識與轉換成功！", state="complete", expanded=False)
                         st.success("🎉 所有檔案辨識與轉換成功！")
                         st.info(f"📊 **系統監控日誌：**\n\n{audit_msg}")
                         
@@ -90,9 +91,11 @@ def main():
                             use_container_width=True
                         )
                     else:
+                        status.update(label="❌ 處理失敗", state="error", expanded=True)
                         st.error(f"❌ 轉換失敗：{audit_msg}")
 
                 except Exception as e:
+                    status.update(label="❌ 發生未預期的錯誤", state="error", expanded=True)
                     st.error(f"❌ OCR 處理過程中發生未預期的錯誤：{e}")
 
 if __name__ == "__main__":
