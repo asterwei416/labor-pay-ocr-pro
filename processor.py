@@ -66,11 +66,16 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
     model = genai.GenerativeModel(model_name)
     
     prompt = """
-    這是一份「勞作金名冊」掃描件。請執行以下任務：
-    1. 輸出 CSV 資料，標題行：「編號,姓名,AI_辨識疑慮」。
-    2. 【🚨 嚴格命令：禁止漏行】即便字跡模糊也必須輸出一行，看不懂填 `?`。
-    3. 【AI_辨識疑慮填寫規則】字跡清楚填「否」，字跡模糊難辨填「是(說明原因)」，完全解譯失敗填「?」。
-    4. 在 CSV 區塊之後，請務必加上一行標註：`TOTAL_ROWS: [數字]`，代表你辨識到的資料總數(不含標題)。
+    這是一份「勞作金名冊」手寫掃描件。請執行以下任務：
+    1. 【🧐 嚴謹思維鏈分析】在輸出資料前，請仔細觀察圖片中表格的每一列。特別注意：
+       - 編號多為數字，手寫連筆容易誤判（例如：數字 8 容易寫得像 5 或 0；數字 5 容易寫得像 1 ；編號最後一碼經常帶有勾筆或變形）。
+       - 姓名為中文，請根據筆畫結構、前後文與常見百家姓推敲草寫字。
+       - 請先在 `<thinking>` 標籤內，簡短記錄你對每一列模糊字跡（尤其是編號）的推論過程。
+    2. 【📋 輸出 CSV 資料】標題行必須為：「編號,姓名,AI_辨識疑慮」。
+       - 請務必將 CSV 資料段落獨立包裝在 ```csv 與 ``` 區塊內。
+    3. 【🚨 嚴格命令：禁止漏行】即便字跡模糊也必須輸出一行，完全看不懂的字元請填 `?`，切勿整行跳過。
+    4. 【⚠️ AI_辨識疑慮填寫規則】字跡清楚填「否」；字跡模糊、連筆難辨（特別是數字末碼或姓名）請填「是(說明原因，例如：編號末字筆畫像8也像5)」；完全解譯失敗填「?」。
+    5. 【📊 總計標註】在 CSV 區塊之後，請務必加上獨立一行標註：`TOTAL_ROWS: [數字]`，代表你辨識到的資料總筆數(不含標題)。
     """
 
     # 判斷 target_path 是檔案還是目錄，準備要處理的檔案清單
@@ -120,7 +125,7 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
             
             if "```" in full_text:
                 csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
-                if csv_blocks: csv_part = csv_blocks[0].strip()
+                if csv_blocks: csv_part = csv_blocks[-1].strip()  # 抓最後一個區塊，防止 thinking block 也包裝在 markdown block 中
 
             # 解析 CSV (手動逐行解析確保防呆)
             parsed_rows = []
