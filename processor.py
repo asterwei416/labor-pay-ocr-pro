@@ -1,0 +1,167 @@
+import os
+import time
+import pandas as pd
+import re
+import streamlit as st
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    st.error("❌ 請先安裝套件: pip install google-generativeai pandas openpyxl")
+
+# 嘗試讀取同目錄下的 .env 檔案以確保向下相容
+def load_env_file():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    clean_v = v.strip().strip("'").strip('"').strip()
+                    os.environ[k.strip()] = clean_v
+
+def get_api_key():
+    # 優先嘗試從 Streamlit secrets 取得 (雲端部署用)
+    try:
+        if st.secrets and "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass
+    
+    # 若無，則嘗試從環境變數取得 (包括 .env)
+    return os.getenv("GEMINI_API_KEY")
+
+def process_labor_pay_pdf(input_pdf_path: str, output_excel_path: str) -> tuple[bool, str]:
+    """
+    整合原始 OCR 檢核邏輯的處理模組。
+    """
+    load_env_file() # 自動載入本地 API KEY
+    
+    api_key = get_api_key()
+    if not api_key or not api_key.strip():
+        return False, "未偵測到 API Key。如果在本地執行，請確認專案資料夾有 .env 檔案或設定好 Streamlit Secrets。"
+
+    genai.configure(api_key=api_key.strip())
+    
+    # 動態優選最強模型
+    try:
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    except Exception as e:
+        return False, f"API Key 驗證失敗: {e}"
+
+    priority_list = [
+        'models/gemini-2.5-pro', 
+        'models/gemini-2.0-pro', 
+        'models/gemini-1.5-pro-latest',
+        'models/gemini-1.5-pro'
+    ]
+    
+    model_name = 'gemini-1.5-pro'
+    for p in priority_list:
+        if p in available_models:
+            model_name = p.replace('models/', '')
+            break
+
+    model = genai.GenerativeModel(model_name)
+    
+    prompt = """
+    這是一份「勞作金名冊」掃描件。請執行以下任務：
+    1. 輸出 CSV 資料，標題行：「編號,姓名,AI_辨識疑慮」。
+    2. 【🚨 嚴格命令：禁止漏行】即便字跡模糊也必須輸出一行，看不懂填 `?`。
+    3. 【AI_辨識疑慮填寫規則】字跡清楚填「否」，字跡模糊難辨填「是(說明原因)」，完全解譯失敗填「?」。
+    4. 在 CSV 區塊之後，請務必加上一行標註：`TOTAL_ROWS: [數字]`，代表你辨識到的資料總數(不含標題)。
+    """
+
+    uploaded_file = None
+    audit_msg = ""
+    try:
+        uploaded_file = genai.upload_file(input_pdf_path)
+        time.sleep(5)  # 等待文檔處理
+        
+        response = model.generate_content([uploaded_file, prompt])
+        full_text = response.text.strip()
+        
+        # 分離 CSV 與 對帳統計
+        csv_part = full_text
+        expected_count = 0
+        
+        # Regex 抓取 TOTAL_ROWS: [數字]
+        match = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
+        if match:
+            expected_count = int(match.group(1))
+        
+        if "```" in full_text:
+            csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
+            if csv_blocks: csv_part = csv_blocks[0].strip()
+
+        # 解析 CSV (手動逐行解析確保防呆)
+        parsed_rows = []
+        raw_lines = csv_part.strip().split("\n")
+        header = None
+        for line in raw_lines:
+            fields = [f.strip() for f in line.split(",")]
+            if header is None:
+                header = fields[:3]
+                continue
+            padded = (fields[:3] + ['', '', ''])[:3]
+            parsed_rows.append(padded)
+            
+        df = pd.DataFrame(parsed_rows, columns=header if header else ['編號', '姓名', 'AI_辨識疑慮'])
+        actual_count = len(df)
+        
+        # 對帳監控
+        if expected_count > 0:
+            is_match = (actual_count == expected_count)
+            log_icon = "✅" if is_match else "⚠️"
+            diff_count = abs(expected_count - actual_count)
+            log_detail = f"100% 吻合" if is_match else f"筆數不符，差 {diff_count} 筆"
+            audit_msg = f"對帳監控：預期 {expected_count} 筆 / 實得 {actual_count} 筆 ({log_icon} {log_detail})"
+        else:
+            audit_msg = f"解析筆數：{actual_count} 筆 (未取得 AI 預期統計)"
+
+        # 檢核邏輯
+        def check_reliability(row):
+            warnings = []
+            target_cols = [c for c in df.columns if c != 'AI_辨識疑慮']
+            id_col = next((c for c in target_cols if '編號' in str(c) or '號' in str(c)), None)
+            name_col = next((c for c in target_cols if '姓名' in str(c) or '名' in str(c)), None)
+            
+            if not id_col or pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ['?', 'nan', '']:
+                warnings.append("🚨嚴重:編號遺失")
+            elif not str(row[id_col]).strip().isdigit():
+                warnings.append("⚠️異狀:編號非數字")
+                    
+            if not name_col or pd.isna(row.get(name_col)) or str(row.get(name_col)).strip() in ['?', 'nan', '']:
+                warnings.append("🚨嚴重:姓名遺失")
+            
+            ai_note = str(row.get('AI_辨識疑慮', '')).strip()
+            if ai_note and ai_note not in ['nan', '否', '正常', '?', 'None', 'False', 'True', '0', '1']:
+                warnings.append(f"🤖AI註記:{ai_note}")
+            
+            return " | ".join(warnings) if warnings else "正常"
+            
+        df['AI_辨識疑慮'] = df.apply(check_reliability, axis=1)
+        
+        # 重複檢測
+        id_col = next((c for c in df.columns if '編號' in str(c) or '號' in str(c)), None)
+        if id_col:
+            valid_mask = df[id_col].notna() & (~df[id_col].astype(str).str.strip().isin(['?', '??', 'nan', '']))
+            dup_mask = pd.Series(False, index=df.index)
+            dup_mask[valid_mask] = df.loc[valid_mask, id_col].duplicated(keep=False)
+            if dup_mask.any():
+                df.loc[dup_mask, 'AI_辨識疑慮'] = df.loc[dup_mask, 'AI_辨識疑慮'].astype(str) + " | ⚠️重複編號"
+                
+        # 存檔
+        with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+            
+        return True, audit_msg
+
+    except Exception as e:
+        return False, f"OCR 處理失敗: {e}"
+    finally:
+        if uploaded_file: 
+            try:
+                genai.delete_file(uploaded_file.name)
+            except Exception:
+                pass
