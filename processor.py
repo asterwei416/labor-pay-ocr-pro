@@ -85,18 +85,28 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
 
     all_dfs = {}
     audit_logs = []
+    
+    total_files = len(pdf_files)
+    progress_text = st.empty()
+    progress_bar = st.empty()
 
-    for pdf_file in pdf_files:
+    for idx, pdf_file in enumerate(pdf_files):
         # sheet_name 最長31字元，且不能包含特殊字元
         base_name = os.path.basename(pdf_file).replace('.pdf', '')
         sheet_name = re.sub(r'[\\/\*\?\[\]:]', '', base_name)[:31]
         
+        progress_text.info(f"⏳ 正在處理第 {idx + 1}/{total_files} 個檔案：`{base_name}` ...")
+        if total_files > 0:
+            progress_bar.progress(idx / total_files)
+            
         uploaded_file = None
         try:
             uploaded_file = genai.upload_file(pdf_file)
+            progress_text.info(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識，此步驟需要較長時間...")
             time.sleep(5)  # 等待文檔處理完畢
             
             response = model.generate_content([uploaded_file, prompt])
+            progress_text.info(f"🧠 `{base_name}` AI 辨識完成，正在解析並轉換資料結構...")
             full_text = response.text.strip()
             
             # 分離 CSV 與 對帳統計
@@ -180,6 +190,13 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str) -> tuple[boo
                 except Exception:
                     pass
                     
+    if total_files > 0:
+        progress_bar.progress(1.0)
+    progress_text.success("✅ 所有檔案皆已通過 AI 辨識與資料解析！準備產出報表...")
+    time.sleep(1)
+    progress_text.empty()
+    progress_bar.empty()
+
     # 所有檔案處理完畢，合併打包成單一 Excel (多個 Sheet 分頁)
     if all_dfs:
         try:
