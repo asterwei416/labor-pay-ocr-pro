@@ -84,25 +84,30 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
     - 依筆畫結構＋常見百家姓交叉推敲草寫字
     - 連筆字請拆解部首後比對常見漢字
 
-    【編號位數強制規則——最高優先】
-    - 本名冊所有編號**必為四位數**（例如 5007、9844、7210）。
-    - 若辨識結果不足四位（如只讀到 500、981），代表有數字被遺漏，必須重新審視該格，補上缺失數字。
-    - 補上後若仍不確定，在 AI_辨識疑慮填寫「是(數字疑慮：編號疑似缺位，補填為 XXXX)」。
-    - 禁止輸出三位或五位以上的編號；若真的完全無法確認第四位，填 `?` 補位（如 500?）。
+    【有效列判斷——最優先執行】
+    - 只擷取「編號欄有數字、姓名欄有中文姓名」的人員記錄列。
+    - 以下內容**不是人員記錄，直接跳過，不輸出**：
+      * 計算公式列（如「16天×35人=560天」、「4.5天×2人=9天」等含「×」「=」「天」的算式）
+      * 空白列
+      * 頁首標題列
+
+    【編號位數強制規則】
+    - 所有有效人員編號**必為四位數**（例如 5007、9844、7210）。
+    - 若讀到三位數（如 500），代表有一位被遺漏，必須重新審視後補上；補後仍不確定，填 `?` 補位（如 500?）。
+    - ⚠️ 無論如何都**不可因編號不確定而漏行**——寧可輸出 `500?` 也不可省略該列。
 
     【任務步驟】
-    1. 先在 `<thinking>` 標籤內，逐列針對「編號」數字做交叉比對推論，記錄任何疑慮。
-       特別確認每個編號是否為四位數，不足者重新檢查。
-    2. 輸出 CSV，標題行必須為：「編號,姓名,AI_辨識疑慮」
+    1. 直接輸出 CSV，標題行必須為：「編號,姓名,AI_辨識疑慮」
        - CSV 必須包在 ```csv ``` 區塊內。
-    3. 禁止漏行：字跡模糊也必須輸出，完全無法辨識填 `?`。
-    4. AI_辨識疑慮填寫規則：
+       - **不需要輸出任何前置思考或推論文字**，直接進入 CSV 區塊。
+    2. 禁止漏行：所有有效人員列字跡模糊也必須輸出，完全無法辨識填 `?`。
+    3. AI_辨識疑慮填寫規則：
        - 編號任一數字非 100% 清晰 → 填「是(數字疑慮：說明)」
        - 編號補位不確定 → 填「是(數字疑慮：編號疑似缺位，補填為 XXXX)」
        - 姓名有連筆難辨 → 填「是(姓名連筆：說明)」
        - 全部清晰確定 → 填「正常」
        - 完全失敗 → 填「?」
-    5. CSV 區塊後輸出：`TOTAL_ROWS: [數字]`
+    4. CSV 區塊後輸出：`TOTAL_ROWS: [數字]`（只計算人員記錄列數，不含跳過的計算公式列）
     """
 
     # 判斷 target_path 是檔案還是目錄，準備要處理的檔案清單
@@ -139,7 +144,17 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
             
         uploaded_file = None
         try:
-            uploaded_file = genai.upload_file(pdf_file)
+            # 上傳最多重試 2 次（應對網路抖動）
+            for attempt in range(3):
+                try:
+                    uploaded_file = genai.upload_file(pdf_file)
+                    break
+                except Exception as upload_err:
+                    if attempt == 2:
+                        raise
+                    log_status(f"⚠️ `{base_name}` 上傳失敗（第 {attempt + 1} 次），3 秒後重試... ({upload_err})")
+                    time.sleep(3)
+
             log_status(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識...")
 
             while uploaded_file.state.name == "PROCESSING":
@@ -192,41 +207,11 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
             else:
                 audit_logs.append(f"【{sheet_name}】: 解析筆數 {actual_count} 筆 (未取得 AI 預期統計)")
 
-            # 欄位名稱
-            id_col = next((c for c in df.columns if '編號' in str(c) or '號' in str(c)), None)
-            name_col = next((c for c in df.columns if '姓名' in str(c) or '名' in str(c)), None)
-
-            # 重置為正常，只標記真正需要人工確認的情況
-            df['AI_辨識疑慮'] = '正常'
-
-            if id_col:
-                valid_mask = df[id_col].notna() & (~df[id_col].astype(str).str.strip().isin(['?', '??', 'nan', '']))
-
-                # 完全重複編號
-                dup_mask = pd.Series(False, index=df.index)
-                dup_mask[valid_mask] = df.loc[valid_mask, id_col].duplicated(keep=False)
-                if dup_mask.any():
-                    df.loc[dup_mask, 'AI_辨識疑慮'] = '⚠️確認重複編號'
-
-                # 近似重複：編號差 1 碼 + 姓名有共同字
-                valid_ids = df.loc[valid_mask, id_col].astype(str).str.strip().tolist()
-                valid_names = df.loc[valid_mask, name_col].astype(str).str.strip().tolist() if name_col else [''] * len(valid_ids)
-                valid_indices = df.loc[valid_mask].index.tolist()
-
-                near_dup_flags = {}
-                for i in range(len(valid_ids)):
-                    for j in range(i + 1, len(valid_ids)):
-                        a, b = valid_ids[i], valid_ids[j]
-                        if len(a) != len(b) or sum(x != y for x, y in zip(a, b)) != 1:
-                            continue
-                        name_a, name_b = valid_names[i], valid_names[j]
-                        if not (set(name_a) & set(name_b) - {'?', ''}):
-                            continue
-                        near_dup_flags.setdefault(valid_indices[i], []).append(f"{b}({name_b})")
-                        near_dup_flags.setdefault(valid_indices[j], []).append(f"{a}({name_a})")
-
-                for idx_val, similar_list in near_dup_flags.items():
-                    df.at[idx_val, 'AI_辨識疑慮'] = '⚠️近似重複:疑與' + '、'.join(similar_list) + '混淆'
+            # 保留 AI 原始疑慮，補上「正常」預設值
+            if 'AI_辨識疑慮' not in df.columns:
+                df['AI_辨識疑慮'] = '正常'
+            else:
+                df['AI_辨識疑慮'] = df['AI_辨識疑慮'].fillna('正常').replace('', '正常')
 
             all_dfs[sheet_name] = df
 
@@ -242,14 +227,111 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
     log_status("✅ 所有檔案皆已通過 AI 辨識與資料解析！準備產出報表...")
     time.sleep(1)
 
-    # 所有檔案處理完畢，合併打包成單一 Excel (多個 Sheet 分頁)
+    # ── 跨頁重複偵測 ──────────────────────────────────────────
+    # 合併所有頁的資料，統一比對編號與姓名
+    if all_dfs:
+        # 建立含來源頁名的合併表
+        combined_rows = []
+        for sn, d in all_dfs.items():
+            id_col   = next((c for c in d.columns if '編號' in str(c) or '號' in str(c)), None)
+            name_col = next((c for c in d.columns if '姓名' in str(c) or '名' in str(c)), None)
+            if not id_col or not name_col:
+                continue
+            for ridx, row in d.iterrows():
+                raw_id   = str(row.get(id_col,   '')).strip()
+                raw_name = str(row.get(name_col, '')).strip()
+                if raw_id in ('', 'nan', '?') or raw_name in ('', 'nan', '?'):
+                    continue
+                combined_rows.append({
+                    'sheet': sn, 'ridx': ridx,
+                    'id': raw_id, 'name': raw_name,
+                    'id_col': id_col, 'name_col': name_col,
+                })
+
+        flag_map = {}   # (sheet, ridx) -> list of flag strings
+
+        def add_flag(sheet, ridx, msg):
+            flag_map.setdefault((sheet, ridx), []).append(msg)
+
+        n = len(combined_rows)
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = combined_rows[i], combined_rows[j]
+                # 同一頁同一列不比
+                if a['sheet'] == b['sheet'] and a['ridx'] == b['ridx']:
+                    continue
+
+                id_a, id_b     = a['id'], b['id']
+                name_a, name_b = a['name'], b['name']
+                loc_b = f"{b['sheet']}({name_b}/{id_b})"
+                loc_a = f"{a['sheet']}({name_a}/{id_a})"
+
+                # 1. 編號完全相同
+                if id_a == id_b:
+                    add_flag(a['sheet'], a['ridx'], f"🔴跨頁同編號:{loc_b}")
+                    add_flag(b['sheet'], b['ridx'], f"🔴跨頁同編號:{loc_a}")
+                    continue
+
+                # 2. 姓名完全相同（編號不同也算可疑）
+                if name_a == name_b and len(name_a) >= 2:
+                    add_flag(a['sheet'], a['ridx'], f"🟠跨頁同姓名:{loc_b}")
+                    add_flag(b['sheet'], b['ridx'], f"🟠跨頁同姓名:{loc_a}")
+
+                # 3. 近似編號（長度相同，差 ≤2 碼）+ 姓名有共同字
+                if len(id_a) == len(id_b):
+                    diff = sum(x != y for x, y in zip(id_a, id_b))
+                    if 1 <= diff <= 2:
+                        common_chars = set(name_a) & set(name_b) - {'?', '', ' '}
+                        if common_chars:
+                            add_flag(a['sheet'], a['ridx'], f"🟡近似編號:{loc_b}")
+                            add_flag(b['sheet'], b['ridx'], f"🟡近似編號:{loc_a}")
+
+        # 將旗標寫回各頁 DataFrame
+        for (sn, ridx), flags in flag_map.items():
+            if sn not in all_dfs:
+                continue
+            d = all_dfs[sn]
+            existing = str(d.at[ridx, 'AI_辨識疑慮']) if 'AI_辨識疑慮' in d.columns else '正常'
+            if existing in ('正常', 'nan', ''):
+                existing = ''
+            else:
+                existing = existing + ' / '
+            d.at[ridx, 'AI_辨識疑慮'] = existing + ' / '.join(flags)
+
+        # 建立「重複疑慮彙整」總表
+        summary_rows = []
+        for (sn, ridx), flags in flag_map.items():
+            if sn not in all_dfs:
+                continue
+            d = all_dfs[sn]
+            id_col   = next((c for c in d.columns if '編號' in str(c) or '號' in str(c)), None)
+            name_col = next((c for c in d.columns if '姓名' in str(c) or '名' in str(c)), None)
+            summary_rows.append({
+                '來源頁':   sn,
+                '編號':     d.at[ridx, id_col]   if id_col   else '',
+                '姓名':     d.at[ridx, name_col] if name_col else '',
+                '疑慮說明': ' / '.join(flags),
+            })
+
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows).sort_values(['疑慮說明', '編號']).reset_index(drop=True)
+        else:
+            summary_df = pd.DataFrame(columns=['來源頁', '編號', '姓名', '疑慮說明'])
+            summary_df.loc[0] = ['（無疑慮）', '', '', '']
+
+    # ── 寫出 Excel ───────────────────────────────────────────
     if all_dfs:
         try:
             with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
+                # 第一頁：重複疑慮彙整總表
+                summary_df.to_excel(writer, sheet_name='⚠️重複疑慮彙整', index=False)
+                # 其餘各頁原始資料
                 for sn, d in all_dfs.items():
                     d.to_excel(writer, sheet_name=sn, index=False)
-                    
+
             global_audit_msg = "\n".join(audit_logs)
+            if summary_rows:
+                global_audit_msg += f"\n\n🔍 跨頁重複疑慮共 {len(summary_rows)} 筆，請查看「⚠️重複疑慮彙整」頁。"
             return True, global_audit_msg
         except Exception as e:
             return False, f"Excel 打包失敗: {e}"
