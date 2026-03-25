@@ -6,6 +6,7 @@ import tempfile
 import glob
 from processor import process_labor_pay_pdf
 
+
 def extract_gdrive_id(url):
     """從 Google Drive 網址中萃取出 ID 與類型 (檔案或資料夾)"""
     # 判斷是否為資料夾 (包含 /drive/folders/ 或 /open?id= 且非文件特定 url)
@@ -27,6 +28,7 @@ def main():
     st.title("📄 勞作金名冊 OCR 轉換系統")
     st.markdown("支援單一 PDF 檔案或是 **整個裝滿 PDF 的資料夾**。\n請在下方輸入公開分享的 Google Drive 連結，系統會自動辨識並轉換為 Excel 檔案。")
     st.info("💡 提示：請確定 Google Drive 檔案或資料夾的共用狀態已設定為「知道連結的人皆可檢視」。")
+
 
     gdrive_url = st.text_input("🔗 輸入 Google Drive 網址", placeholder="https://drive.google.com/drive/folders/1k1xOmDu... 或 /file/d/...")
 
