@@ -1,5 +1,7 @@
 import os
 import time
+import tempfile
+import shutil
 import pandas as pd
 import re
 import glob
@@ -9,6 +11,13 @@ try:
     import google.generativeai as genai
 except ImportError:
     st.error("❌ 請先安裝套件: pip install google-generativeai pandas openpyxl")
+
+try:
+    import fitz  # pymupdf
+    from PIL import Image, ImageEnhance
+    _ENHANCE_AVAILABLE = True
+except ImportError:
+    _ENHANCE_AVAILABLE = False
 
 # 嘗試讀取同目錄下的 .env 檔案以確保向下相容
 def load_env_file():
@@ -30,6 +39,25 @@ def get_api_key():
         pass
     # 若無，則嘗試從環境變數取得 (包括 .env)
     return os.getenv("GEMINI_API_KEY")
+
+def pdf_to_enhanced_images(pdf_path: str, out_dir: str) -> list[str]:
+    """將 PDF 每頁轉為增強對比的 PNG，回傳圖片路徑清單。"""
+    if not _ENHANCE_AVAILABLE:
+        return []
+    doc = fitz.open(pdf_path)
+    paths = []
+    for i, page in enumerate(doc):
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img = img.convert("L")
+        img = ImageEnhance.Contrast(img).enhance(2.0)
+        img = ImageEnhance.Sharpness(img).enhance(2.0)
+        out_path = os.path.join(out_dir, f"page_{i}.png")
+        img.save(out_path, "PNG")
+        paths.append(out_path)
+    doc.close()
+    return paths
+
 
 def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_container=None) -> tuple[bool, str]:
     """
@@ -126,52 +154,109 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
         
         log_status(f"⏳ 正在處理第 {idx + 1}/{total_files} 個檔案：`{base_name}` ...")
             
-        uploaded_file = None
+        uploaded_files = []
+        img_tmp_dir = None
         try:
-            uploaded_file = genai.upload_file(pdf_file)
-            log_status(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識...")
-            
-            # 輪詢檔案狀態
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = genai.get_file(uploaded_file.name)
-            
-            if uploaded_file.state.name == "FAILED":
-                raise Exception("AI 模型處理檔案失敗")
+            # ── 影像增強 ──────────────────────────────────────────
+            if _ENHANCE_AVAILABLE:
+                img_tmp_dir = tempfile.mkdtemp()
+                image_paths = pdf_to_enhanced_images(pdf_file, img_tmp_dir)
+                log_status(f"🖼️ `{base_name}` 影像增強完成（{len(image_paths)} 頁），正在上傳...")
+                for img_path in image_paths:
+                    uf = genai.upload_file(img_path)
+                    while uf.state.name == "PROCESSING":
+                        time.sleep(2)
+                        uf = genai.get_file(uf.name)
+                    if uf.state.name == "FAILED":
+                        raise Exception("AI 模型處理影像失敗")
+                    uploaded_files.append(uf)
+            else:
+                # 無增強套件，fallback 直接上傳原始 PDF
+                uf = genai.upload_file(pdf_file)
+                while uf.state.name == "PROCESSING":
+                    time.sleep(2)
+                    uf = genai.get_file(uf.name)
+                if uf.state.name == "FAILED":
+                    raise Exception("AI 模型處理檔案失敗")
+                uploaded_files.append(uf)
+                log_status(f"↖️ `{base_name}` 已上傳（未套用影像增強），正在辨識...")
 
-            response = model.generate_content([uploaded_file, prompt])
-            log_status(f"🧠 `{base_name}` AI 辨識完成，正在解析數據...")
+            # ── 第一階段 OCR ──────────────────────────────────────
+            log_status(f"🧠 `{base_name}` 第一階段 OCR 辨識中...")
+            response = model.generate_content([*uploaded_files, prompt])
             full_text = response.text.strip()
-            
-            # 分離 CSV 與 對帳統計
-            csv_part = full_text
-            expected_count = 0
-            
-            match = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
-            if match:
-                expected_count = int(match.group(1))
-            
-            if "```" in full_text:
-                csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
-                if csv_blocks: csv_part = csv_blocks[-1].strip()
 
             # 解析 CSV
-            parsed_rows = []
-            raw_lines = csv_part.strip().split("\n")
-            header = None
-            for line in raw_lines:
-                if not line.strip(): continue
-                fields = [f.strip() for f in line.split(",")]
-                if header is None:
-                    header = fields[:3]
-                    continue
-                padded = (fields[:3] + ['', '', ''])[:3]
-                parsed_rows.append(padded)
-                
+            def parse_csv_from_text(text):
+                csv_part = text
+                if "```" in text:
+                    blocks = re.findall(r"```(?:csv)?(.*?)```", text, re.DOTALL)
+                    if blocks:
+                        csv_part = blocks[-1].strip()
+                rows, header = [], None
+                for line in csv_part.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    fields = [f.strip() for f in line.split(",")]
+                    if header is None:
+                        header = fields[:3]
+                        continue
+                    rows.append((fields[:3] + ['', '', ''])[:3])
+                return header, rows
+
+            header, parsed_rows = parse_csv_from_text(full_text)
             df = pd.DataFrame(parsed_rows, columns=header if header else ['編號', '姓名', 'AI_辨識疑慮'])
             actual_count = len(df)
-            
-            # 對帳監控
+
+            expected_count = 0
+            m = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
+            if m:
+                expected_count = int(m.group(1))
+
+            # ── 第二階段驗證（疑慮行重送）────────────────────────
+            suspicious_mask = df['AI_辨識疑慮'].str.contains('是', na=False)
+            if suspicious_mask.any():
+                suspicious_count = suspicious_mask.sum()
+                log_status(f"🔍 `{base_name}` 發現 {suspicious_count} 行有疑慮，進行第二階段驗證...")
+
+                lines_desc = []
+                for pos, (_, row) in enumerate(df[suspicious_mask].iterrows(), 1):
+                    lines_desc.append(f"行{pos}: 編號={row['編號']}, 姓名={row['姓名']}, 疑慮={row['AI_辨識疑慮']}")
+                suspicious_str = "\n".join(lines_desc)
+
+                stage2_prompt = f"""
+這是同一份「勞作金名冊」掃描件。第一次辨識後，以下行有疑慮，請重新放大仔細辨識：
+
+{suspicious_str}
+
+【重點：字形混淆對照表】
+- `8`：豎線旁帶封閉圈套，極易被誤判為 `1`、`5` 或 `0`
+- `5`：草寫形似 `1` 或 `7`
+- `0`：偏扁形似 `6` 或 `9`
+- `1`：末端帶鉤注意是否為 `7`
+
+只輸出這些行的修正結果，標題行：「編號,姓名,AI_辨識疑慮」
+請將 CSV 包在 ```csv ``` 區塊內。
+"""
+                s2_response = model.generate_content([*uploaded_files, stage2_prompt])
+                _, s2_rows = parse_csv_from_text(s2_response.text.strip())
+
+                if s2_rows:
+                    s2_df = pd.DataFrame(s2_rows, columns=['編號', '姓名', 'AI_辨識疑慮'])
+                    for _, s2_row in s2_df.iterrows():
+                        # 先嘗試以編號比對，找不到則以姓名比對
+                        idx_match = df.index[df['編號'] == s2_row['編號']].tolist()
+                        if not idx_match:
+                            idx_match = df.index[df['姓名'] == s2_row['姓名']].tolist()
+                        if idx_match:
+                            i = idx_match[0]
+                            df.at[i, '編號'] = s2_row['編號']
+                            df.at[i, '姓名'] = s2_row['姓名']
+                            df.at[i, 'AI_辨識疑慮'] = s2_row['AI_辨識疑慮'] + " [二次驗證]"
+
+                log_status(f"✅ `{base_name}` 二次驗證完成。")
+
+            # ── 對帳監控 ─────────────────────────────────────────
             if expected_count > 0:
                 is_match = (actual_count == expected_count)
                 log_icon = "✅" if is_match else "⚠️"
@@ -181,35 +266,32 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
             else:
                 audit_logs.append(f"【{sheet_name}】: 解析筆數 {actual_count} 筆 (未取得 AI 預期統計)")
 
-            # 檢核邏輯
+            # ── 檢核邏輯 ─────────────────────────────────────────
             def check_reliability(row):
                 warnings = []
                 target_cols = [c for c in df.columns if c != 'AI_辨識疑慮']
                 id_col = next((c for c in target_cols if '編號' in str(c) or '號' in str(c)), None)
                 name_col = next((c for c in target_cols if '姓名' in str(c) or '名' in str(c)), None)
-                
-                # 處理編號
+
                 if not id_col or pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ['?', 'nan', '']:
                     warnings.append("🚨嚴重:編號遺失")
                 else:
                     id_val = str(row[id_col]).strip()
                     if not id_val.isdigit():
                         warnings.append(f"⚠️異狀:編號非純數字({id_val})")
-                
-                # 處理姓名
+
                 if not name_col or pd.isna(row.get(name_col)) or str(row.get(name_col)).strip() in ['?', 'nan', '']:
                     warnings.append("🚨嚴重:姓名遺失")
-                
-                # 整合 AI 原始註記
+
                 ai_note = str(row.get('AI_辨識疑慮', '')).strip()
                 if ai_note and ai_note.lower() not in ['nan', '否', '正常', '?', 'none', 'false', 'true', '0', '1']:
                     warnings.append(f"🤖AI原始註記:{ai_note}")
-                
+
                 return " | ".join(warnings) if warnings else "正常"
-                
+
             df['AI_辨識疑慮'] = df.apply(check_reliability, axis=1)
-            
-            # 重複檢測
+
+            # ── 重複檢測 ─────────────────────────────────────────
             id_col = next((c for c in df.columns if '編號' in str(c) or '號' in str(c)), None)
             if id_col:
                 valid_mask = df[id_col].notna() & (~df[id_col].astype(str).str.strip().isin(['?', '??', 'nan', '']))
@@ -217,17 +299,19 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                 dup_mask[valid_mask] = df.loc[valid_mask, id_col].duplicated(keep=False)
                 if dup_mask.any():
                     df.loc[dup_mask, 'AI_辨識疑慮'] = df.loc[dup_mask, 'AI_辨識疑慮'].astype(str) + " | ⚠️重複編號"
-                    
+
             all_dfs[sheet_name] = df
 
         except Exception as e:
             audit_logs.append(f"【{sheet_name}】: ❌ 處理發生錯誤 - {e}")
         finally:
-            if uploaded_file: 
+            for uf in uploaded_files:
                 try:
-                    genai.delete_file(uploaded_file.name)
+                    genai.delete_file(uf.name)
                 except Exception:
                     pass
+            if img_tmp_dir:
+                shutil.rmtree(img_tmp_dir, ignore_errors=True)
                     
     # 移除未定義的 progress_bar 呼叫，改用 log_status 或檢查是否存在
     if 'progress_bar' in locals() or 'progress_bar' in globals():
