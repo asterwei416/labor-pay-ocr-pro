@@ -115,7 +115,7 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
             try:
                 # 兼容 streamlit status 物件與一般文字容器
                 status_container.write(msg)
-            except:
+            except Exception:
                 st.write(msg)
         else:
             print(msg)
@@ -228,25 +228,9 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                     genai.delete_file(uploaded_file.name)
                 except Exception:
                     pass
-                    
-    # 移除未定義的 progress_bar 呼叫，改用 log_status 或檢查是否存在
-    if 'progress_bar' in locals() or 'progress_bar' in globals():
-        try:
-            progress_bar.progress(1.0)
-        except:
-            pass
-        
+
     log_status("✅ 所有檔案皆已通過 AI 辨識與資料解析！準備產出報表...")
     time.sleep(1)
-    
-    if not status_container:
-        # 確保這些 Streamlit 元件存在才嘗試清空
-        if 'progress_text' in locals() or 'progress_text' in globals():
-            try: progress_text.empty()
-            except: pass
-        if 'progress_bar' in locals() or 'progress_bar' in globals():
-            try: progress_bar.empty()
-            except: pass
 
     # 所有檔案處理完畢，合併打包成單一 Excel (多個 Sheet 分頁)
     if all_dfs:
