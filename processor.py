@@ -64,12 +64,7 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
             model_name = p.replace('models/', '')
             break
 
-    generation_config = genai.GenerationConfig(
-        temperature=0.1,
-        top_p=0.95,
-        max_output_tokens=8192,
-    )
-    model = genai.GenerativeModel(model_name, generation_config=generation_config)
+    model = genai.GenerativeModel(model_name)
     
     prompt = """
     這是一份「勞作金名冊」手寫掃描件。請只擷取「編號」與「姓名」兩欄。
