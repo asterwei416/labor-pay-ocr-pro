@@ -28,7 +28,6 @@ def get_api_key():
             return st.secrets["GEMINI_API_KEY"]
     except Exception:
         pass
-    
     # 若無，則嘗試從環境變數取得 (包括 .env)
     return os.getenv("GEMINI_API_KEY")
 
@@ -51,8 +50,8 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
         return False, f"API Key 驗證失敗: {e}"
 
     priority_list = [
-        'models/gemini-2.5-pro', 
-        'models/gemini-2.0-pro', 
+        'models/gemini-2.0-pro-exp-02-05',
+        'models/gemini-2.0-flash-exp',
         'models/gemini-1.5-pro-latest',
         'models/gemini-1.5-pro'
     ]
@@ -98,17 +97,15 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
     
     total_files = len(pdf_files)
 
-    if status_container:
-        progress_bar = status_container.progress(0)
-    else:
-        progress_text = st.empty()
-        progress_bar = st.empty()
-
     def log_status(msg):
         if status_container:
-            status_container.write(msg)
+            try:
+                # 兼容 streamlit status 物件與一般文字容器
+                status_container.write(msg)
+            except:
+                st.write(msg)
         else:
-            progress_text.info(msg)
+            print(msg)
 
     for idx, pdf_file in enumerate(pdf_files):
         # sheet_name 最長31字元，且不能包含特殊字元
@@ -116,37 +113,42 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
         sheet_name = re.sub(r'[\\/\*\?\[\]:]', '', base_name)[:31]
         
         log_status(f"⏳ 正在處理第 {idx + 1}/{total_files} 個檔案：`{base_name}` ...")
-        if total_files > 0:
-            progress_bar.progress(idx / total_files)
             
         uploaded_file = None
         try:
             uploaded_file = genai.upload_file(pdf_file)
-            log_status(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識，此步驟需要較長時間...")
-            time.sleep(5)  # 等待文檔處理完畢
+            log_status(f"↖️ `{base_name}` 已上傳至 AI 模型，正在進行高精準度 OCR 辨識...")
             
+            # 輪詢檔案狀態
+            while uploaded_file.state.name == "PROCESSING":
+                time.sleep(2)
+                uploaded_file = genai.get_file(uploaded_file.name)
+            
+            if uploaded_file.state.name == "FAILED":
+                raise Exception("AI 模型處理檔案失敗")
+
             response = model.generate_content([uploaded_file, prompt])
-            log_status(f"🧠 `{base_name}` AI 辨識完成，正在解析並轉換資料結構...")
+            log_status(f"🧠 `{base_name}` AI 辨識完成，正在解析數據...")
             full_text = response.text.strip()
             
             # 分離 CSV 與 對帳統計
             csv_part = full_text
             expected_count = 0
             
-            # Regex 抓取 TOTAL_ROWS: [數字]
             match = re.search(r"TOTAL_ROWS:\s*(\d+)", full_text, re.IGNORECASE)
             if match:
                 expected_count = int(match.group(1))
             
             if "```" in full_text:
                 csv_blocks = re.findall(r"```(?:csv)?(.*?)```", full_text, re.DOTALL)
-                if csv_blocks: csv_part = csv_blocks[-1].strip()  # 抓最後一個區塊，防止 thinking block 也包裝在 markdown block 中
+                if csv_blocks: csv_part = csv_blocks[-1].strip()
 
-            # 解析 CSV (手動逐行解析確保防呆)
+            # 解析 CSV
             parsed_rows = []
             raw_lines = csv_part.strip().split("\n")
             header = None
             for line in raw_lines:
+                if not line.strip(): continue
                 fields = [f.strip() for f in line.split(",")]
                 if header is None:
                     header = fields[:3]
@@ -174,17 +176,22 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                 id_col = next((c for c in target_cols if '編號' in str(c) or '號' in str(c)), None)
                 name_col = next((c for c in target_cols if '姓名' in str(c) or '名' in str(c)), None)
                 
+                # 處理編號
                 if not id_col or pd.isna(row.get(id_col)) or str(row.get(id_col)).strip() in ['?', 'nan', '']:
                     warnings.append("🚨嚴重:編號遺失")
-                elif not str(row[id_col]).strip().isdigit():
-                    warnings.append("⚠️異狀:編號非數字")
-                        
+                else:
+                    id_val = str(row[id_col]).strip()
+                    if not id_val.isdigit():
+                        warnings.append(f"⚠️異狀:編號非純數字({id_val})")
+                
+                # 處理姓名
                 if not name_col or pd.isna(row.get(name_col)) or str(row.get(name_col)).strip() in ['?', 'nan', '']:
                     warnings.append("🚨嚴重:姓名遺失")
                 
+                # 整合 AI 原始註記
                 ai_note = str(row.get('AI_辨識疑慮', '')).strip()
-                if ai_note and ai_note not in ['nan', '否', '正常', '?', 'None', 'False', 'True', '0', '1']:
-                    warnings.append(f"🤖AI註記:{ai_note}")
+                if ai_note and ai_note.lower() not in ['nan', '否', '正常', '?', 'none', 'false', 'true', '0', '1']:
+                    warnings.append(f"🤖AI原始註記:{ai_note}")
                 
                 return " | ".join(warnings) if warnings else "正常"
                 
