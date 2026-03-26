@@ -263,8 +263,8 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
 
                 id_a, id_b     = a['id'], b['id']
                 name_a, name_b = a['name'], b['name']
-                loc_b = f"{b['sheet']}({name_b}/{id_b})"
-                loc_a = f"{a['sheet']}({name_a}/{id_a})"
+                loc_b = f"({name_b}/{id_b})"
+                loc_a = f"({name_a}/{id_a})"
 
                 # 1. 🔴 編號相同 且 姓名相同（≥2字）→ 確定重複
                 if id_a == id_b and name_a == name_b and len(name_a) >= 2:
@@ -278,16 +278,13 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                     add_flag(b['sheet'], b['ridx'], f"🟠同編號異名:{loc_a}")
                     continue
 
-                # 3. 🟡 近似判斷：編號四位數中兩位相同(順序一致) 且 姓名一字相同(順序一致)
+                # 3. 🟡 近似判斷：編號四位數中三位相同(順序一致) 且 姓名一字相同(順序一致)
                 if len(id_a) == 4 and len(id_b) == 4:
                     id_match_count = sum(1 for x, y in zip(id_a, id_b) if x == y)
-                    name_match = False
-                    for k in range(min(len(name_a), len(name_b))):
-                        if name_a[k] == name_b[k] and name_a[k] not in ('?', '', ' '):
-                            name_match = True
-                            break
+                    name_match_count = sum(1 for k in range(min(len(name_a), len(name_b))) 
+                                          if name_a[k] == name_b[k] and name_a[k] not in ('?', '', ' '))
                     
-                    if id_match_count >= 2 and name_match:
+                    if id_match_count >= 3 and name_match_count >= 1:
                         add_flag(a['sheet'], a['ridx'], f"🟡人工核查:{loc_b}")
                         add_flag(b['sheet'], b['ridx'], f"🟡人工核查:{loc_a}")
 
