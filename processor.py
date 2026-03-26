@@ -298,6 +298,7 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
 
         # AI 二次判斷近似編號候選對
         if ai_candidates:
+            st.info(f"🔍 近似編號候選名單：{len(ai_candidates)} 對，送 AI 二次判斷中…")
             import json as _json
             pair_list = [
                 {
@@ -330,14 +331,18 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                 json_end   = raw.rfind(']') + 1
                 if json_start != -1 and json_end > json_start:
                     verdicts = _json.loads(raw[json_start:json_end])
+                    kept = 0
                     for v in verdicts:
                         if v.get('verdict') == '可疑':
+                            kept += 1
                             c = ai_candidates[v['index']]
                             reason = v.get('reason', '')
                             add_flag(c['a']['sheet'], c['a']['ridx'],
                                      f"🟡近似編號:{c['loc_b']}（{reason}）")
                             add_flag(c['b']['sheet'], c['b']['ridx'],
                                      f"🟡近似編號:{c['loc_a']}（{reason}）")
+                    filtered = len(ai_candidates) - kept
+                    st.info(f"✅ AI 判斷完成：{kept} 對標為可疑 🟡，{filtered} 對判為不同人已過濾")
             except Exception as e:
                 st.warning(f"⚠️ AI 近似編號判斷失敗，略過此步驟：{e}")
 
