@@ -248,7 +248,8 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                     'id_col': id_col, 'name_col': name_col,
                 })
 
-        flag_map = {}   # (sheet, ridx) -> list of flag strings
+        flag_map = {}        # (sheet, ridx) -> list of flag strings
+        ai_candidates = []   # 近似編號候選對，待 AI 二次判斷
 
         def add_flag(sheet, ridx, msg):
             flag_map.setdefault((sheet, ridx), []).append(msg)
@@ -266,25 +267,79 @@ def process_labor_pay_pdf(target_path: str, output_excel_path: str, status_conta
                 loc_b = f"{b['sheet']}({name_b}/{id_b})"
                 loc_a = f"{a['sheet']}({name_a}/{id_a})"
 
-                # 1. 編號完全相同
-                if id_a == id_b:
-                    add_flag(a['sheet'], a['ridx'], f"🔴跨頁同編號:{loc_b}")
-                    add_flag(b['sheet'], b['ridx'], f"🔴跨頁同編號:{loc_a}")
+                # 1. 編號相同 且 姓名相同 → 確定重複，直接標記
+                if id_a == id_b and name_a == name_b and len(name_a) >= 2:
+                    add_flag(a['sheet'], a['ridx'], f"🔴確定重複:{loc_b}")
+                    add_flag(b['sheet'], b['ridx'], f"🔴確定重複:{loc_a}")
                     continue
 
-                # 2. 姓名完全相同（編號不同也算可疑）
-                if name_a == name_b and len(name_a) >= 2:
-                    add_flag(a['sheet'], a['ridx'], f"🟠跨頁同姓名:{loc_b}")
-                    add_flag(b['sheet'], b['ridx'], f"🟠跨頁同姓名:{loc_a}")
+                # 1b. 編號相同 但 姓名不同 → 直接標記（人工核查哪筆編號打錯）
+                if id_a == id_b and name_a != name_b and len(name_a) >= 2 and len(name_b) >= 2:
+                    add_flag(a['sheet'], a['ridx'], f"🟠同編號異名:{loc_b}")
+                    add_flag(b['sheet'], b['ridx'], f"🟠同編號異名:{loc_a}")
+                    continue
 
-                # 3. 近似編號（長度相同，差 ≤2 碼）+ 姓名有共同字
+                # 2. 近似編號候選 → 交給 AI 二次判斷
+                #    條件：長度相同、diff ≤2、名字有共同字
+                #    過濾：若共同字只有姓氏（第一字）且 diff=2 → 噪音太多，略過
                 if len(id_a) == len(id_b):
                     diff = sum(x != y for x, y in zip(id_a, id_b))
-                    if 1 <= diff <= 2:
-                        common_chars = set(name_a) & set(name_b) - {'?', '', ' '}
-                        if common_chars:
-                            add_flag(a['sheet'], a['ridx'], f"🟡近似編號:{loc_b}")
-                            add_flag(b['sheet'], b['ridx'], f"🟡近似編號:{loc_a}")
+                    common_any = set(name_a) & set(name_b) - {'?', '', ' '}
+                    if 1 <= diff <= 2 and len(common_any) >= 1:
+                        # 過濾：共同字只剩姓氏且 diff=2 → 不進候選
+                        only_surname = (common_any == {name_a[0]}
+                                        and name_a[0] == name_b[0]
+                                        and diff == 2)
+                        if not only_surname:
+                            ai_candidates.append({
+                                'a': a, 'b': b,
+                                'loc_a': loc_a, 'loc_b': loc_b,
+                            })
+
+        # AI 二次判斷近似編號候選對
+        if ai_candidates:
+            import json as _json
+            pair_list = [
+                {
+                    "index": idx,
+                    "a": {"id": c['a']['id'], "name": c['a']['name'], "sheet": c['a']['sheet']},
+                    "b": {"id": c['b']['id'], "name": c['b']['name'], "sheet": c['b']['sheet']},
+                }
+                for idx, c in enumerate(ai_candidates)
+            ]
+            judge_prompt = f"""你是一位手寫工資表審核員。以下是從手寫文件 OCR 出的人員資料配對，編號長度相同且姓氏一致，但編號有 1-2 碼差異。
+
+請逐一判斷：這兩筆在手寫環境下是否可能因為筆跡難以辨認而其實是同一個人？
+
+判斷原則：
+- 名字完全不同（如「家明」vs「家輝」，字型差異大）→ 不同人
+- 名字高度相似（如「家明」vs「家朋」，手寫易混淆）→ 可疑
+- 只有姓氏相同、名字毫無關聯 → 不同人
+
+請以 JSON 陣列回傳，每項格式：{{"index": <數字>, "verdict": "可疑" 或 "不同人", "reason": "<一句話>"}}
+
+配對清單：
+{_json.dumps(pair_list, ensure_ascii=False)}"""
+
+            try:
+                judge_model = genai.GenerativeModel(model_name)
+                judge_resp = judge_model.generate_content(judge_prompt)
+                raw = judge_resp.text.strip()
+                # 取出 JSON 陣列
+                json_start = raw.find('[')
+                json_end   = raw.rfind(']') + 1
+                if json_start != -1 and json_end > json_start:
+                    verdicts = _json.loads(raw[json_start:json_end])
+                    for v in verdicts:
+                        if v.get('verdict') == '可疑':
+                            c = ai_candidates[v['index']]
+                            reason = v.get('reason', '')
+                            add_flag(c['a']['sheet'], c['a']['ridx'],
+                                     f"🟡近似編號:{c['loc_b']}（{reason}）")
+                            add_flag(c['b']['sheet'], c['b']['ridx'],
+                                     f"🟡近似編號:{c['loc_a']}（{reason}）")
+            except Exception as e:
+                st.warning(f"⚠️ AI 近似編號判斷失敗，略過此步驟：{e}")
 
         # 將旗標寫回各頁 DataFrame
         for (sn, ridx), flags in flag_map.items():
